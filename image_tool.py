@@ -6,8 +6,8 @@ Image Tool - render one PDF page to a compact PNG.
 Run:  python image_tool.py
 Then enter the PDF path, the page number (PDF page position, 1 = first page)
 and choose:
-  1) Dynamic DPI - DPI picked from the page's own picture resolution;
-     output capped at 3200 px long edge and fitted to ~1.5 MB.
+  1) Dynamic DPI - at least 450 DPI, pushed as high as possible (up to 900 DPI)
+     while the PNG stays under 4 MB. Use this by default.
   2) Select DPI  - render at exactly 300 / 450 / 600 / 900 / 1200 DPI.
 
 PNGs are kept small with an adaptive 256-colour palette + dithering
@@ -47,23 +47,19 @@ OUTPUT_FOLDER = Path(__file__).resolve().parent / "Images_of_image_tool"
 DPI_CHOICES = (300, 450, 600, 900, 1200)
 PT_PER_INCH = 72
 
-# Dynamic DPI (high-detail, zoomable output)
-DYN_MIN_DPI, DYN_MAX_DPI = 150, 300
-DYN_OVERSAMPLE = 1.5            # x native picture resolution
-DYN_VECTOR_DPI = 300            # pages with no embedded pictures
-DYN_MAX_EDGE = 3200             # px
-DYN_MIN_EDGE = 2400             # never shrink below this to meet the budget
-DYN_BUDGET = 1500 * 1024        # bytes
+# Dynamic DPI (option 1): at least DYN_MIN_DPI, as high as the size budget allows.
+DYN_MIN_DPI = 450               # never render below this
+DYN_MAX_DPI = 900               # upper limit; atlas drawings are stored at ~150 ppi,
+                                # so higher only sharpens text and lines
+DYN_STEP = 25                   # DPI search step
+DYN_BUDGET = 4_000_000          # bytes; every option-1 PNG stays strictly below 4 MB
+DYN_SIZE_EXPONENT = 1.6         # PNG size grows about DPI^1.6 on atlas pages (measured)
 
 # Safety cap for very high DPI renders (~250 MP needs ~1.5 GB RAM).
 MAX_PIXELS = 250_000_000
 Image.MAX_IMAGE_PIXELS = None   # local, trusted PDFs - allow big renders
 
-# Ignore logos/icons smaller than this share of the page when reading
-# the native resolution of embedded pictures.
-MIN_PICTURE_AREA = 0.04
-
-# Palette attempts for Dynamic DPI, best-looking first: (colours, dither).
+# Palette attempts, best-looking first: (colours, dither).
 PALETTE_STEPS = ((256, True), (192, True), (128, True), (256, False), (128, False))
 
 
@@ -148,38 +144,6 @@ def dpi_check(text: str) -> int:
 # =====================================================================
 # RENDERING
 # =====================================================================
-
-def native_ppi(page: "pdfium.PdfPage") -> Optional[float]:
-    """Highest resolution among the page's significant embedded pictures."""
-    w_pt, h_pt = page.get_size()
-    page_area = max(w_pt * h_pt, 1.0)
-    best = None
-    try:
-        for obj in page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE], max_depth=4):
-            try:
-                px_w, px_h = obj.get_px_size()
-                m = obj.get_matrix()
-            except Exception:  # noqa: BLE001 - skip unreadable objects
-                continue
-            ow, oh = math.hypot(m.a, m.b), math.hypot(m.c, m.d)
-            if ow <= 0 or oh <= 0 or px_w < 2 or px_h < 2:
-                continue
-            if ow * oh / page_area < MIN_PICTURE_AREA:
-                continue
-            ppi = min(px_w / (ow / PT_PER_INCH), px_h / (oh / PT_PER_INCH))
-            best = ppi if best is None else max(best, ppi)
-    except Exception:  # noqa: BLE001 - analysis is best-effort
-        return None
-    return best
-
-
-def dynamic_dpi(page: "pdfium.PdfPage") -> float:
-    ppi = native_ppi(page)
-    dpi = ppi * DYN_OVERSAMPLE if ppi else DYN_VECTOR_DPI
-    dpi = min(max(dpi, DYN_MIN_DPI), DYN_MAX_DPI)
-    long_edge_in = max(page.get_size()) / PT_PER_INCH
-    return min(dpi, DYN_MAX_EDGE / long_edge_in)
-
 
 def render(page: "pdfium.PdfPage", dpi: float) -> Image.Image:
     w_pt, h_pt = page.get_size()
@@ -274,36 +238,66 @@ def encode_fixed(image: Image.Image, dpi: float) -> Tuple[bytes, str]:
     return pal, "256 colours"
 
 
-def encode_dynamic(image: Image.Image, dpi: float) -> Tuple[bytes, Image.Image, str]:
-    """Dynamic DPI: best-looking PNG within DYN_BUDGET, never below DYN_MIN_EDGE."""
-    while True:
-        if image.mode == "L":
-            data = png(image, dpi)
-            if len(data) <= DYN_BUDGET:
-                return data, image, "grayscale"
-        else:
-            exact = exact_palette_png(image, dpi)
-            if exact is not None and len(exact) <= DYN_BUDGET:
-                return exact, image, "lossless"
+def encode_within_budget(image: Image.Image, dpi: float,
+                         max_step: int = len(PALETTE_STEPS) - 1) -> Optional[Tuple[bytes, str, int]]:
+    """Best-looking PNG of this exact image (no resizing) that is under DYN_BUDGET.
 
-        rgb = image.convert("RGB") if image.mode == "L" else image
-        smallest = None
-        for i, (n, dither) in enumerate(PALETTE_STEPS):
-            data = png_palette(rgb, dpi, n, dither)
-            label = f"{n} colours" + ("" if dither else ", no dither")
-            if smallest is None or len(data) < len(smallest[0]):
-                smallest = (data, label)
-            if len(data) <= DYN_BUDGET:
-                if i == 0 and image.mode != "L" and is_flat_graphic(image):
-                    full = png(image, dpi)
-                    if len(full) <= DYN_BUDGET and len(full) <= 1.25 * len(data):
-                        return full, image, "lossless"
-                return data, image, label
+    Returns (png, description, quality step) or None. Step -1 is lossless; steps 0..n are
+    PALETTE_STEPS, best first. max_step stops it trading colour quality for size.
+    """
+    if image.mode == "L":
+        data = png(image, dpi)
+        if len(data) < DYN_BUDGET:
+            return data, "grayscale", -1
+        rgb = image.convert("RGB")
+    else:
+        exact = exact_palette_png(image, dpi)
+        if exact is not None and len(exact) < DYN_BUDGET:
+            return exact, "lossless", -1
+        rgb = image
+    for i, (n, dither) in enumerate(PALETTE_STEPS[:max_step + 1]):
+        data = png_palette(rgb, dpi, n, dither)
+        if len(data) < DYN_BUDGET:
+            if i == 0 and image.mode != "L" and is_flat_graphic(image):
+                full = png(image, dpi)
+                if len(full) < DYN_BUDGET and len(full) <= 1.25 * len(data):
+                    return full, "lossless", -1
+            return data, f"{n} colours" + ("" if dither else ", no dither"), i
+    return None
 
-        new_edge = int(max(image.size) * 0.85)
-        if new_edge < DYN_MIN_EDGE:
-            return smallest[0], image, smallest[1]
-        image = shrink(image, new_edge)
+
+def _render_within_budget(page: "pdfium.PdfPage", dpi: float, max_step: int = len(PALETTE_STEPS) - 1):
+    image = render(page, dpi)
+    if is_grayscale(image):
+        image = image.convert("L")
+    size = image.size
+    result = encode_within_budget(image, dpi, max_step)
+    del image
+    return result, size
+
+
+def render_dynamic(page: "pdfium.PdfPage") -> Tuple[bytes, int, Tuple[int, int], str]:
+    """Option 1: the highest DPI from DYN_MIN_DPI to DYN_MAX_DPI whose PNG is under DYN_BUDGET.
+
+    Renders once at DYN_MIN_DPI, predicts the highest DPI that should still fit, then steps
+    down by DYN_STEP until one fits. A higher DPI is only accepted at the same or better
+    colour quality than the DYN_MIN_DPI render, so sharpness is never bought with banding.
+    Returns (png, dpi, (width, height), description).
+    """
+    probe, size = _render_within_budget(page, DYN_MIN_DPI)
+    if probe is None:
+        raise ToolError(f"This page cannot be saved under {DYN_BUDGET / 1e6:.0f} MB even at "
+                        f"{DYN_MIN_DPI} DPI. Use option 2 with a lower DPI.")
+    data, how, step = probe
+    best = (data, DYN_MIN_DPI, size, how)
+    target = DYN_MIN_DPI * (DYN_BUDGET * 0.97 / len(data)) ** (1 / DYN_SIZE_EXPONENT)
+    dpi = min(DYN_MAX_DPI, int(target // DYN_STEP) * DYN_STEP)
+    while dpi > DYN_MIN_DPI:
+        result, size = _render_within_budget(page, dpi, step)
+        if result is not None and result[2] <= step:
+            return result[0], dpi, size, result[1]
+        dpi -= DYN_STEP
+    return best
 
 
 # =====================================================================
@@ -359,23 +353,25 @@ def main() -> int:
             print("\nWorking...")
             page = pdf[page_no - 1]
             try:
-                dpi = fixed_dpi or dynamic_dpi(page)
-                image = render(page, dpi)
+                if fixed_dpi:
+                    dpi = fixed_dpi
+                    image = render(page, dpi)
+                else:
+                    data, dpi, (width, height), how = render_dynamic(page)
             finally:
                 page.close()
         finally:
             pdf.close()
 
-        if is_grayscale(image):
-            image = image.convert("L")
         if fixed_dpi:
+            if is_grayscale(image):
+                image = image.convert("L")
             data, how = encode_fixed(image, dpi)
+            width, height = image.size
+            del image
             name = f"{slugify(pdf_path.stem)}_p{page_no}_{fixed_dpi}dpi.png"
         else:
-            data, image, how = encode_dynamic(image, dpi)
             name = f"{slugify(pdf_path.stem)}_p{page_no}_dynamic.png"
-        width, height = image.size
-        del image
 
         out = OUTPUT_FOLDER / name
         save(data, out)
